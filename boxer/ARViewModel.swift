@@ -16,7 +16,7 @@ final class ARViewModel: ObservableObject {
     @Published var status: String = "Initializing..."
     @Published var isProcessing: Bool = false
     @Published var detections: [DetectionInfo] = []
-    @Published var confidenceThreshold: Float = 0.3
+    @Published var confidenceThreshold: Float = 0.8
 
     var sceneView: ARSCNView?
     private var boxerNet: BoxerNet?
@@ -127,7 +127,6 @@ final class ARViewModel: ObservableObject {
         )
 
         // 5. BoxerNet 3D lifting.
-        await MainActor.run { self.status = "BoxerNet: \(boxes2D.count) boxes..." }
         let conf = await MainActor.run { self.confidenceThreshold }
         let detections = try boxer.predict(
             image: boxerImage, depthMap: depthMap, intrinsics: intrinsics,
@@ -135,10 +134,7 @@ final class ARViewModel: ObservableObject {
             confidenceThreshold: conf
         )
 
-        let labels = detections.map { $0.label ?? "?" }.joined(separator: ", ")
-        await MainActor.run {
-            self.status = "\(detections.count) 3D: \(labels)"
-        }
+        await MainActor.run { self.status = "Ready" }
         return detections
     }
 

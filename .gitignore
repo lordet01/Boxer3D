@@ -14,3 +14,4 @@ DerivedData/
 
 # ONNX models (too large for git — use Git LFS or download script)
 *.onnx
+*.pyc
