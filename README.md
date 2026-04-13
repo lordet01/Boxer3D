@@ -33,7 +33,7 @@ iPhone Camera + LiDAR
 
 - iPhone 12 Pro or later (LiDAR required)
 - iOS 16.0+
-- ~200 MB storage for models
+- ~450 MB storage for models
 
 ## Setup
 
@@ -46,8 +46,8 @@ iPhone Camera + LiDAR
 2. **Download models** (excluded from git)
    
    Place these in the `boxer/` directory:
-   - `BoxerNet.onnx` (191 MB, float16) — exported from BoxerNet checkpoint
-   - `yolo11n.onnx` (5 MB, float16) — exported from Ultralytics YOLO11n
+   - `BoxerNet.onnx` (~391 MB, float32) — exported from BoxerNet checkpoint
+   - `yolo11n.onnx` (~10 MB, float32) — exported from Ultralytics YOLO11n
 
 3. **Open in Xcode**
    ```bash
