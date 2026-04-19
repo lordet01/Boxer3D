@@ -51,6 +51,18 @@ final class ARViewModel: ObservableObject {
     private var yoloDetector: YOLODetector?
     private var boxNodes: [SCNNode] = []
 
+    /// BoxerNet 가 출력하는 `center` 가 박스의 어느 점인지에 대한 컨벤션.
+    /// 실측 결과 BoxerNet 라벨은 **top-center** (객체 윗면 중앙) 였다.
+    ///
+    /// - `.topCenter` (기본/정답): 모델 center = 박스 윗면 중앙.
+    ///   → 박스 중심을 voxel `+Z` 방향으로 `-size.z/2` 만큼 내린다 (= 아래로 절반).
+    /// - `.centroid`: 모델 center = 박스 무게중심. lift 없음.
+    /// - `.floorCenter`: 모델 center = 박스 바닥 중심. `+size.z/2` 위로.
+    ///
+    /// 검증 시나리오에 따라 토글하기 위해 enum으로 두지만, 운영에서는 `.topCenter` 고정.
+    enum BoxAnchorMode { case topCenter, centroid, floorCenter }
+    static var anchorMode: BoxAnchorMode = .topCenter
+
     func setup(sceneView: ARSCNView) {
         self.sceneView = sceneView
         Task.detached { await self.loadModelsInBackground() }
@@ -254,6 +266,9 @@ final class ARViewModel: ObservableObject {
 
         let colors: [UIColor] = [.systemRed, .systemGreen, .systemBlue]
 
+        // ARKit world Y 가 up. 카메라 / floor 위치 기준으로 박스가 어디 있는지 한번에 본다.
+        let camY: Float = sceneView.session.currentFrame?.camera.transform.columns.3.y ?? .nan
+
         for (i, det) in detections.enumerated() {
             let color = colors[i % colors.count]
 
@@ -265,8 +280,69 @@ final class ARViewModel: ObservableObject {
             mat.isDoubleSided = true
             box.materials = [mat]
 
+            // 박스 중심을 voxel +Z(=world up) 방향으로 anchorMode 에 맞춰 보정한다.
+            // 모델 center 가 top  → 박스 중심을 -size.z/2 (아래로 절반)
+            //          centroid  → 보정 없음
+            //          floor    → +size.z/2 (위로 절반)
+            // 박스의 voxel +Z 축 = worldTransform.columns.2.
+            var transform = det.worldTransform
+            let upInWorldRaw = simd_normalize(simd_float3(
+                transform.columns.2.x,
+                transform.columns.2.y,
+                transform.columns.2.z
+            ))
+            let lift: Float
+            switch Self.anchorMode {
+            case .topCenter:   lift = -det.size.z / 2
+            case .centroid:    lift = 0
+            case .floorCenter: lift = +det.size.z / 2
+            }
+            if lift != 0 {
+                let shifted = det.center + upInWorldRaw * lift
+                transform.columns.3 = simd_float4(shifted, 1)
+            }
+
+            // 박스의 "위/아래" 길이는 voxel +Z 방향으로 펼쳐진다.
+            // (size.z 가 height — gravityAlign() 결과 voxel Z = world up.)
+            let upInWorld = simd_normalize(simd_float3(
+                transform.columns.2.x,
+                transform.columns.2.y,
+                transform.columns.2.z
+            ))
+            let centerWorld = simd_float3(
+                transform.columns.3.x,
+                transform.columns.3.y,
+                transform.columns.3.z
+            )
+            // box bottom / top in world = center ± up * size.z/2.
+            let bottomWorld = centerWorld - upInWorld * (det.size.z / 2)
+            let topWorld    = centerWorld + upInWorld * (det.size.z / 2)
+            // 카메라 대비, world Y(=up) 좌표:
+            //   - centerY  : 박스 중심의 절대 높이
+            //   - bottomY  : 박스 하단의 절대 높이 (=객체가 놓인 면이면 floor 와 같아야 함)
+            //   - up.y     : voxel up 이 world up 과 얼마나 정렬됐는지 (1.0 이상적)
+            //   - vsCamY   : 카메라 높이 대비 박스 중심의 상대 높이 (cm)
+            print(String(format:
+                "[boxer] place#%d  size=(%.2f,%.2f,%.2f)m  " +
+                "center=(%.2f,%.2f,%.2f)  bottomY=%.2f  topY=%.2f  " +
+                "up.y=%.3f  cam.y=%.2f  centerVsCam=%+.0fcm  mode=%@",
+                i,
+                det.size.x, det.size.y, det.size.z,
+                centerWorld.x, centerWorld.y, centerWorld.z,
+                bottomWorld.y, topWorld.y,
+                upInWorld.y, camY,
+                (centerWorld.y - camY) * 100,
+                {
+                    switch Self.anchorMode {
+                    case .topCenter:   return "top"
+                    case .centroid:    return "centroid"
+                    case .floorCenter: return "floor"
+                    }
+                }() as String
+            ))
+
             let node = SCNNode(geometry: box)
-            node.simdWorldTransform = det.worldTransform
+            node.simdWorldTransform = transform
 
             // Thick wireframe edges (12 cylinders).
             addWireframe(to: node, size: det.size, color: color, radius: 0.003)
