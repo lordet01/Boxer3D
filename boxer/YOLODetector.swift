@@ -14,7 +14,6 @@ struct YOLOBox {
 /// YOLO11n ONNX inference wrapper.
 final class YOLODetector {
     private let session: ORTSession
-    private let env: ORTEnv
 
     /// COCO class names.
     static let classNames: [String] = [
@@ -33,11 +32,40 @@ final class YOLODetector {
     ]
 
     init(modelPath: String) throws {
-        env = try ORTEnv(loggingLevel: .warning)
+        let env = ORTShared.env
         let opts = try ORTSessionOptions()
-        let coreMLOpts = ORTCoreMLExecutionProviderOptions()
-        try opts.appendCoreMLExecutionProvider(with: coreMLOpts)
+        try opts.setGraphOptimizationLevel(.all)
+
+        // YOLO는 입력 shape가 완전 정적(640x640)이라 RequireStaticInputShapes=1 권장.
+        // → CoreML EP가 더 많은 노드를 ANE로 가져갈 수 있다.
+        let cacheDir = ORTShared.coreMLCacheDir(subdir: "yolo")
+        let coreMLOptsV2: [String: String] = [
+            "ModelFormat": "MLProgram",
+            "MLComputeUnits": "CPUAndNeuralEngine",
+            "RequireStaticInputShapes": "1",
+            "EnableOnSubgraphs": "0",
+            "ModelCacheDirectory": cacheDir,
+        ]
+        do {
+            try opts.appendCoreMLExecutionProvider(withOptionsV2: coreMLOptsV2)
+        } catch {
+            print("[boxer] YOLO CoreML v2 options failed (\(error)) — falling back to v1.")
+            let v1 = ORTCoreMLExecutionProviderOptions()
+            v1.createMLProgram = true
+            try opts.appendCoreMLExecutionProvider(with: v1)
+        }
+
         session = try ORTSession(env: env, modelPath: modelPath, sessionOptions: opts)
+
+        let url = URL(fileURLWithPath: modelPath)
+        let sizeMB = ((try? FileManager.default.attributesOfItem(atPath: modelPath)[.size] as? NSNumber)?.intValue ?? 0) / 1_000_000
+        print("[boxer] YOLODetector loaded: \(url.lastPathComponent) (\(sizeMB) MB), CoreML cache=\(cacheDir)")
+    }
+
+    /// 첫 detection의 CoreML 컴파일 비용을 앱 시작 시점으로 옮긴다.
+    func warmup() throws {
+        let dummy = [Float](repeating: 0, count: 3 * 640 * 640)
+        _ = try detect(image: dummy)
     }
 
     /// Run YOLO detection.

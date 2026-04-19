@@ -1,23 +1,30 @@
 // BoxerNet.swift
-// ONNX Runtime inference wrapper for BoxerNet on iOS.
+// Apple CoreML 기반 BoxerNet 추론 래퍼.
 //
-// Dependencies (add to Package.swift or Podfile):
-//   - onnxruntime-objc (via SPM: https://github.com/microsoft/onnxruntime-swift-package-manager)
+// 모델 변환 파이프라인 (한 번만 실행해두면 됨):
+//   1) python scripts/strip_if_nodes.py
+//        --input  models_backup/BoxerNet.fp32.onnx
+//        --output models_backup/BoxerNet.fp32.no_if.onnx
+//   2) python scripts/convert_to_coreml.py
+//        --input  models_backup/BoxerNet.fp32.no_if.onnx
+//        --output boxer/BoxerNet.mlpackage
+//        --num-boxes 8 --precision fp16 --target ios16
 //
-// Usage:
-//   let boxer = try BoxerNet(modelPath: Bundle.main.path(forResource: "BoxerNet", ofType: "onnx")!)
-//   let results = try boxer.predict(
-//       pixelBuffer: frame.capturedImage,
-//       depthMap: frame.sceneDepth!.depthMap,
-//       cameraIntrinsics: frame.camera.intrinsics,
-//       cameraTransform: frame.camera.transform,
-//       boxes2D: yoloDetections
-//   )
+// 그 결과 `boxer/BoxerNet.mlpackage` 가 생성되며 이 파일을 Xcode 번들에 추가해
+// `Bundle.main.url(forResource: "BoxerNet", withExtension: "mlpackage")` 로 찾는다.
+//
+// 왜 ONNX Runtime + CoreML EP 가 아닌 CoreML 직접 변환인가:
+//  * ORT의 CoreML EP는 ONNX 그래프의 dtype을 그대로 따라가서 ViT의 attention
+//    경로에서 GPU FP16 overflow → NaN 을 자주 뱉었다.
+//  * Apple CoreML 컨버터는 transformer-aware한 dtype 정책으로
+//    LayerNorm/Softmax/MatMul 주변을 자동으로 안전하게 다룬다.
+//  * .mlpackage 가 자체 압축으로 ONNX 보다 훨씬 작다 (BoxerNet: 400 MB → 200 MB).
+//  * iOS 의 ANE/GPU/CPU 디스패치가 CoreML에 가장 잘 통합돼 있다.
 
 import Foundation
 import Accelerate
 import simd
-import OnnxRuntimeBindings
+import CoreML
 
 // MARK: - Data Types
 
@@ -50,8 +57,7 @@ struct Box2D {
 // MARK: - BoxerNet
 
 final class BoxerNet {
-    private let session: ORTSession
-    private let env: ORTEnv
+    private let model: MLModel
 
     /// Image size the model expects (960x960).
     static let imageSize: Int = 960
@@ -62,13 +68,74 @@ final class BoxerNet {
     static let gridW: Int = imageSize / patchSize  // 60
     static let numPatches: Int = gridH * gridW     // 3600
 
+    /// CoreML 모델은 변환 시점에 `num_boxes` 차원을 정수로 박았기 때문에
+    /// 호출부는 항상 정확히 이 값만큼의 박스를 보내야 한다.
+    /// 부족하면 더미 박스(score=0)로 padding 한다 (`predict` 안에서 처리).
+    /// 변환 시 `--num-boxes 8` 와 일치해야 한다.
+    static let fixedNumBoxes: Int = 8
+
+    /// CoreML 컴퓨트 유닛 선택.
+    /// `.all` = ANE/GPU/CPU 자동 디스패치 (가장 빠르고 메모리 효율적).
+    /// 디버깅 목적으로 `.cpuOnly` / `.cpuAndGPU` 로 바꿀 수 있다.
+    static let preferredComputeUnits: MLComputeUnits = .all
+
     init(modelPath: String) throws {
-        env = try ORTEnv(loggingLevel: .warning)
-        let opts = try ORTSessionOptions()
-        // CoreML EP → Metal GPU / Neural Engine acceleration.
-        let coreMLOpts = ORTCoreMLExecutionProviderOptions()
-        try opts.appendCoreMLExecutionProvider(with: coreMLOpts)
-        session = try ORTSession(env: env, modelPath: modelPath, sessionOptions: opts)
+        // .mlpackage 또는 .mlmodelc 둘 다 받을 수 있게 한다.
+        // 번들에 .mlpackage 가 들어 있으면 iOS 빌드 시 자동으로 .mlmodelc 로 컴파일됨.
+        let url = URL(fileURLWithPath: modelPath)
+
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = Self.preferredComputeUnits
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        // .mlpackage 는 MLModel(contentsOf:) 가 직접 받는다 (iOS 16+).
+        // 첫 로드 시 컴파일이 일어날 수 있어 시간이 걸리고, 컴파일 결과는
+        // 디스크에 캐시된다.
+        self.model = try MLModel(contentsOf: url, configuration: configuration)
+        let loadMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
+
+        let sizeBytes: Int = {
+            if url.hasDirectoryPath {
+                // mlpackage 는 디렉토리 — 안의 모든 파일 합산.
+                let enumerator = FileManager.default.enumerator(at: url,
+                                                                includingPropertiesForKeys: [.fileSizeKey])
+                var total = 0
+                while let f = enumerator?.nextObject() as? URL {
+                    let sz = (try? f.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    total += sz
+                }
+                return total
+            } else {
+                return ((try? FileManager.default.attributesOfItem(atPath: modelPath)[.size] as? NSNumber)?.intValue ?? 0)
+            }
+        }()
+        let sizeMB = sizeBytes / 1_000_000
+
+        let cu: String
+        switch Self.preferredComputeUnits {
+        case .cpuOnly: cu = "cpuOnly"
+        case .cpuAndGPU: cu = "cpuAndGPU"
+        case .all: cu = "all (ANE+GPU+CPU)"
+        case .cpuAndNeuralEngine: cu = "cpuAndNeuralEngine"
+        @unknown default: cu = "?"
+        }
+        print("[boxer] BoxerNet loaded: \(url.lastPathComponent) (\(sizeMB) MB), "
+              + "computeUnits=\(cu), num_boxes fixed=\(Self.fixedNumBoxes), "
+              + String(format: "load=%.0fms", loadMs))
+    }
+
+    /// 더미 입력 1회 추론 → CoreML의 graph 컴파일/캐시 비용을 앱 시작 시점으로 옮김.
+    /// 두 번째 호출부터는 캐시 적중으로 거의 즉시 시작한다.
+    func warmup() throws {
+        let S = Self.imageSize
+        let N = Self.numPatches
+        let M = Self.fixedNumBoxes
+        let dummyImage = [Float](repeating: 0, count: 3 * S * S)
+        let dummySDP = [Float](repeating: 1.0, count: N)
+        let dummyBB = [Float](repeating: 0.5, count: M * 4)
+        let dummyRay = [Float](repeating: 0, count: N * 6)
+        _ = try runInference(image: dummyImage, sdpPatches: dummySDP,
+                             bb2d: dummyBB, rayEncoding: dummyRay, numBoxes: M)
     }
 
     // MARK: - Public API
@@ -88,10 +155,27 @@ final class BoxerNet {
         depthMap: [[Float]],       // HxW depth in metres (0 = invalid)
         intrinsics: simd_float3x3, // fx, fy, cx, cy from ARKit
         cameraTransform: simd_float4x4,
-        boxes2D: [Box2D],
+        boxes2D realBoxes2D: [Box2D],
         confidenceThreshold: Float = 0.3
     ) throws -> [Detection3D] {
-        guard !boxes2D.isEmpty else { return [] }
+        guard !realBoxes2D.isEmpty else { return [] }
+
+        // 모델 입력은 정확히 `fixedNumBoxes`개여야 한다 (CoreML이 정수 dim으로 박힘).
+        // 부족하면 image 중앙의 작은 더미 박스를 padding(score=0). 출력에서는
+        // realCount 미만 인덱스만 살린다.
+        let M = Self.fixedNumBoxes
+        let realCount = min(realBoxes2D.count, M)
+        var boxes2D = Array(realBoxes2D.prefix(realCount))
+        if boxes2D.count < M {
+            let pad = Box2D(
+                xmin: Float(Self.imageSize / 2),
+                ymin: Float(Self.imageSize / 2),
+                xmax: Float(Self.imageSize / 2 + 1),
+                ymax: Float(Self.imageSize / 2 + 1),
+                label: nil, score: 0
+            )
+            boxes2D.append(contentsOf: Array(repeating: pad, count: M - boxes2D.count))
+        }
 
         let fx = intrinsics[0][0]
         let fy = intrinsics[1][1]
@@ -133,8 +217,13 @@ final class BoxerNet {
         // 4. Compute Plucker ray encoding.
         let rayEncoding = buildRayEncoding(T_vc: T_vc, fx: fx, fy: fy, cx: cx, cy: cy)
 
-        // 5. Run ONNX inference.
-        let M = boxes2D.count
+        // 5. Run CoreML inference.
+        // 입력 통계도 같이 찍어 입력 자체가 깨졌는지 즉시 확인 가능하게 한다.
+        Self.logTensorStats("image", image)
+        Self.logTensorStats("sdp",   sdpPatches)
+        Self.logTensorStats("bb2d",  bb2dFlat)
+        Self.logTensorStats("ray",   rayEncoding)
+
         let (centers, sizes, yaws, confidences) = try runInference(
             image: image,
             sdpPatches: sdpPatches,
@@ -143,11 +232,26 @@ final class BoxerNet {
             numBoxes: M
         )
 
-        // 6. Postprocess: voxel → world coords.
+        // 진단: 실제 모델이 무엇을 반환했는지 한 번에 보이도록 통계를 찍는다.
+        let realConfs = Array(confidences.prefix(realCount))
+        let nanCount = realConfs.filter { $0.isNaN }.count
+        let infCount = realConfs.filter { $0.isInfinite }.count
+        let validConfs = realConfs.filter { $0.isFinite }
+        let cMin = validConfs.min() ?? .nan
+        let cMax = validConfs.max() ?? .nan
+        let cMean = validConfs.isEmpty ? Float.nan : validConfs.reduce(0, +) / Float(validConfs.count)
+        let centersHead = (0..<min(realCount, 2)).map { i in
+            String(format: "(%.2f,%.2f,%.2f)", centers[i*3], centers[i*3+1], centers[i*3+2])
+        }.joined(separator: ", ")
+        print(String(format:
+            "[boxer] raw confs (N=%d): min=%.3f max=%.3f mean=%.3f  NaN=%d  Inf=%d  centers[0..2]=[\(centersHead)]",
+            realCount, cMin, cMax, cMean, nanCount, infCount))
+
+        // 6. Postprocess: voxel → world coords. realCount 이후는 padding이라 건너뛴다.
         var detections: [Detection3D] = []
-        for i in 0..<M {
+        for i in 0..<realCount {
             let conf = confidences[i]
-            guard conf >= confidenceThreshold else { continue }
+            guard conf.isFinite, conf >= confidenceThreshold else { continue }
 
             let centerVoxel = simd_float3(centers[i * 3], centers[i * 3 + 1], centers[i * 3 + 2])
             let size = simd_float3(sizes[i * 3], sizes[i * 3 + 1], sizes[i * 3 + 2])
@@ -181,7 +285,28 @@ final class BoxerNet {
         return detections
     }
 
-    // MARK: - ONNX Inference
+    // MARK: - Diagnostics
+
+    /// 입력/출력 텐서의 통계를 한 줄로 찍는다 (NaN/Inf/min/max/mean).
+    /// 입력 자체가 깨졌는지 vs 모델 출력이 깨졌는지 구분하기 위해.
+    private static func logTensorStats(_ name: String, _ values: [Float]) {
+        var nan = 0, inf = 0
+        var vmin = Float.infinity, vmax = -Float.infinity, sum: Double = 0, validCount = 0
+        for v in values {
+            if v.isNaN { nan += 1; continue }
+            if v.isInfinite { inf += 1; continue }
+            if v < vmin { vmin = v }
+            if v > vmax { vmax = v }
+            sum += Double(v)
+            validCount += 1
+        }
+        let mean = validCount > 0 ? Float(sum / Double(validCount)) : .nan
+        if validCount == 0 { vmin = .nan; vmax = .nan }
+        print(String(format: "[boxer] in.%@  N=%d  min=%.3f max=%.3f mean=%.3f  NaN=%d Inf=%d",
+                     name as NSString, values.count, vmin, vmax, mean, nan, inf))
+    }
+
+    // MARK: - CoreML Inference
 
     private func runInference(
         image: [Float],
@@ -195,59 +320,91 @@ final class BoxerNet {
         let gW = Self.gridW
         let N = Self.numPatches
 
-        // Create input tensors.
-        let imageData = Data(bytes: image, count: image.count * MemoryLayout<Float>.stride)
-        let imageTensor = try ORTValue(
-            tensorData: NSMutableData(data: imageData),
-            elementType: .float,
-            shape: [1, 3, NSNumber(value: S), NSNumber(value: S)]
-        )
+        // 입력 MLMultiArray 생성. CoreML 모델은 변환 시점에 입력 dtype을 fp32로 두고
+        // 가중치/연산은 fp16으로 가는 형태. fp32 입력으로 그대로 전달하면 된다.
+        let imageArr = try Self.makeMultiArray(values: image,
+                                               shape: [1, 3, S, S])
+        let sdpArr   = try Self.makeMultiArray(values: sdpPatches,
+                                               shape: [1, 1, gH, gW])
+        let bb2dArr  = try Self.makeMultiArray(values: bb2d,
+                                               shape: [1, numBoxes, 4])
+        let rayArr   = try Self.makeMultiArray(values: rayEncoding,
+                                               shape: [1, N, 6])
 
-        let sdpData = Data(bytes: sdpPatches, count: sdpPatches.count * MemoryLayout<Float>.stride)
-        let sdpTensor = try ORTValue(
-            tensorData: NSMutableData(data: sdpData),
-            elementType: .float,
-            shape: [1, 1, NSNumber(value: gH), NSNumber(value: gW)]
-        )
+        let inputs: [String: MLFeatureValue] = [
+            "image":        MLFeatureValue(multiArray: imageArr),
+            "sdp_patches":  MLFeatureValue(multiArray: sdpArr),
+            "bb2d":         MLFeatureValue(multiArray: bb2dArr),
+            "ray_encoding": MLFeatureValue(multiArray: rayArr),
+        ]
+        let provider = try MLDictionaryFeatureProvider(dictionary: inputs)
 
-        let bb2dData = Data(bytes: bb2d, count: bb2d.count * MemoryLayout<Float>.stride)
-        let bb2dTensor = try ORTValue(
-            tensorData: NSMutableData(data: bb2dData),
-            elementType: .float,
-            shape: [1, NSNumber(value: numBoxes), 4]
-        )
+        let outProvider = try model.prediction(from: provider)
 
-        let rayData = Data(bytes: rayEncoding, count: rayEncoding.count * MemoryLayout<Float>.stride)
-        let rayTensor = try ORTValue(
-            tensorData: NSMutableData(data: rayData),
-            elementType: .float,
-            shape: [1, NSNumber(value: N), 6]
-        )
-
-        // Run.
-        let outputs = try session.run(
-            withInputs: [
-                "image": imageTensor,
-                "sdp_patches": sdpTensor,
-                "bb2d": bb2dTensor,
-                "ray_encoding": rayTensor,
-            ],
-            outputNames: ["center", "size", "yaw", "confidence"],
-            runOptions: nil
-        )
-
-        // Extract outputs.
-        let centersData = try outputs["center"]!.tensorData() as Data
-        let sizesData = try outputs["size"]!.tensorData() as Data
-        let yawsData = try outputs["yaw"]!.tensorData() as Data
-        let confsData = try outputs["confidence"]!.tensorData() as Data
-
-        let centers = centersData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        let sizes = sizesData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        let yaws = yawsData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        let confidences = confsData.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        let centers      = try Self.extractFloats(outProvider, name: "center")
+        let sizes        = try Self.extractFloats(outProvider, name: "size")
+        let yaws         = try Self.extractFloats(outProvider, name: "yaw")
+        let confidences  = try Self.extractFloats(outProvider, name: "confidence")
 
         return (centers, sizes, yaws, confidences)
+    }
+
+    /// `[Float]` → `MLMultiArray`(.float32). 데이터를 메모리 카피로 채운다.
+    /// shape의 곱과 values.count 가 일치해야 한다.
+    private static func makeMultiArray(values: [Float], shape: [Int]) throws -> MLMultiArray {
+        let nsShape = shape.map { NSNumber(value: $0) }
+        let arr = try MLMultiArray(shape: nsShape, dataType: .float32)
+        let count = shape.reduce(1, *)
+        precondition(values.count == count,
+                     "MLMultiArray shape \(shape) (=\(count)) != values.count \(values.count)")
+        // Float32 storage. UnsafeMutablePointer<Float> 로 직접 카피하는 게 가장 빠름.
+        let dst = arr.dataPointer.assumingMemoryBound(to: Float.self)
+        values.withUnsafeBufferPointer { src in
+            dst.update(from: src.baseAddress!, count: count)
+        }
+        return arr
+    }
+
+    /// 출력 feature 를 `[Float]` 로 추출. CoreML이 fp16/fp32/double 중 어느 dtype으로
+    /// 반환하든 모두 Float 배열로 normalize 한다.
+    private static func extractFloats(_ provider: MLFeatureProvider, name: String) throws -> [Float] {
+        guard let value = provider.featureValue(for: name) else {
+            throw NSError(domain: "BoxerNet", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Output \(name) missing from CoreML prediction"
+            ])
+        }
+        guard let arr = value.multiArrayValue else {
+            throw NSError(domain: "BoxerNet", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Output \(name) is not an MLMultiArray (type=\(value.type))"
+            ])
+        }
+        let count = arr.count
+        switch arr.dataType {
+        case .float32:
+            let p = arr.dataPointer.assumingMemoryBound(to: Float.self)
+            return Array(UnsafeBufferPointer(start: p, count: count))
+        case .float16:
+            // CoreML이 fp16으로 반환하면 직접 Float로 변환.
+            // Swift는 Float16을 iOS 14+에서 지원.
+            if #available(iOS 14.0, *) {
+                let p = arr.dataPointer.assumingMemoryBound(to: Float16.self)
+                return (0..<count).map { Float(p[$0]) }
+            } else {
+                throw NSError(domain: "BoxerNet", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "Float16 output requires iOS 14+"
+                ])
+            }
+        case .double:
+            let p = arr.dataPointer.assumingMemoryBound(to: Double.self)
+            return (0..<count).map { Float(p[$0]) }
+        case .int32:
+            let p = arr.dataPointer.assumingMemoryBound(to: Int32.self)
+            return (0..<count).map { Float(p[$0]) }
+        @unknown default:
+            throw NSError(domain: "BoxerNet", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "Unsupported MLMultiArray dataType: \(arr.dataType.rawValue)"
+            ])
+        }
     }
 
     // MARK: - Preprocessing: SDP Patches
@@ -274,12 +431,6 @@ final class BoxerNet {
         // Scale factors from depth map to 960x960.
         let scaleX = Float(S) / Float(depthW)
         let scaleY = Float(S) / Float(depthH)
-
-        // Scale intrinsics to 960x960.
-        let fxS = fx * scaleX
-        let fyS = fy * scaleY
-        let cxS = cx * scaleX
-        let cyS = cy * scaleY
 
         // For each depth pixel, project to 960x960 and assign to a patch.
         let step = max(1, Int(sqrt(Float(depthH * depthW) / 20000.0)))
@@ -321,9 +472,6 @@ final class BoxerNet {
         let P = Float(Self.patchSize)
         let gH = Self.gridH
         let gW = Self.gridW
-
-        // Scale intrinsics to 960x960 (assuming fx/fy/cx/cy are for original camera res).
-        // NOTE: Caller should provide intrinsics already scaled to 960x960.
 
         let R_vc = upperLeft3x3(T_vc)
         let originCam = simd_float3(0, 0, 0)

@@ -1,0 +1,12 @@
+onnx>=1.15
+onnxconverter-common>=1.14
+# onnxruntime은 --ort 옵션 사용 시에만 필요 (transformer 친화 FP16 변환기 제공).
+onnxruntime>=1.17
+
+# --- ONNX -> CoreML 변환 (scripts/convert_to_coreml.py) ---
+# onnx2torch: ONNX 그래프를 PyTorch nn.Module로 복원 (ViT/transformer well-supported).
+# coremltools: PyTorch traced 모듈을 .mlpackage(MLProgram)로 변환.
+torch>=2.2
+onnx2torch>=1.5
+coremltools>=7.2
+scikit-learn>=1.0
